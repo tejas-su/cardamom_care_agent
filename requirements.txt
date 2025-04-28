@@ -1,0 +1,11 @@
+langchain
+langgraph
+langchain_groq
+langchain_community
+langchain-google-community
+langchain_core
+langgraph-supervisor
+dotenv
+fastapi[standard]
+bs4
+pandas
