@@ -6,20 +6,17 @@ from typing import Dict, List, Tuple, Any, Optional
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_core.output_parsers import StrOutputParser
 from langchain_community.tools.ddg_search import DuckDuckGoSearchRun
-from langchain_groq import ChatGroq
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
 from prophet import Prophet
-from dotenv import load_dotenv 
 from llms import llama,llamaScout,mistral
 from datetime import datetime, timedelta 
 import requests
 from bs4 import BeautifulSoup
 from pydantic import BaseModel, Field
 from typing import Literal
+import json
 
-#Load the api key
-load_dotenv()
 
 
 # Initialize search tool
@@ -32,6 +29,7 @@ class AgentState(Dict):
     next_agent: Optional[str] = None
     prediction_data: Optional[pd.DataFrame] = None
     search_results: Optional[str] = None
+    conversation_history: Optional[List[Dict]] = None  # Added for memory
 
 # Date handling functions
 def parse_relative_date(date_text: str) -> datetime:
@@ -229,8 +227,7 @@ def extract_date_from_query(query: str) -> Tuple[str, Optional[datetime]]:
 # Load the Prophet model predictions
 def load_predictions():
     """
-    In a real implementation, this would load your pickle file.
-    For demonstration, we'll create sample data similar to your example.
+    Loads the prediction from the saved Prophet modle for 90 days
     """
     with open('prophet_cardamom_model.pkl', 'rb') as f:
         loaded_model = pickle.load(f)
@@ -245,10 +242,11 @@ def load_predictions():
 
 
 class routes(BaseModel):
-    agent : Literal['PREDICTION', 'INFO', 'PRICE_FETCH', 'OFF_TOPIC'] = Field(...,description="""
+    agent : Literal['PREDICTION', 'INFO', 'PRICE_FETCH', 'HISTORICAL_PRICE', 'OFF_TOPIC'] = Field(...,description="""
         - PREDICTION: If the query is about cardamom price predictions or forecasts
         - INFO: If the query is seeking information about cardamom (cultivation, diseases, etc.)
         - PRICE_FETCH: If the query is about current market prices of cardamom
+        - HISTORICAL_PRICE: If the query is about past/historical cardamom prices
         - OFF_TOPIC: If the query is not related to cardamom""")
 
 # Agent Functions
@@ -259,9 +257,8 @@ def router(state: AgentState) -> Dict:
     messages = state["messages"]
     last_message = messages[-1]["content"]
     
-    # Using LlamaScout for the router as it's good at classifying content
-    llm = llamaScout.with_structured_output(routes)
-    llm_response = llm.invoke([
+    # Using LlamaScout for the router with updated classification
+    llm_response = llamaScout.invoke([
         HumanMessage(content=f"""
         Analyze the following user query and determine which specialized agent should handle it:
         
@@ -271,20 +268,24 @@ def router(state: AgentState) -> Dict:
         - PREDICTION: If the query is about cardamom price predictions or forecasts
         - INFO: If the query is seeking information about cardamom (cultivation, diseases, etc.)
         - PRICE_FETCH: If the query is about current market prices of cardamom
+        - HISTORICAL_PRICE: If the query is about past/historical cardamom prices
         - OFF_TOPIC: If the query is not related to cardamom
         
         Just return the option name, nothing else.
         """)
     ])
     
+    agent_type = llm_response.content.strip()
+    
     agent_mapping = {
         "PREDICTION": "prediction_agent",
         "INFO": "info_agent",
         "PRICE_FETCH": "price_fetch_agent",
+        "HISTORICAL_PRICE": "historical_price_agent",
         "OFF_TOPIC": "off_topic_agent"
     }
     
-    next_agent = agent_mapping.get(llm_response.agent, "off_topic_agent")
+    next_agent = agent_mapping.get(agent_type, "off_topic_agent")
     return {"next_agent": next_agent}
 
 def prediction_agent(state: AgentState) -> Dict:
@@ -311,6 +312,10 @@ def prediction_agent(state: AgentState) -> Dict:
     
     # Extract date from user query using our date function
     date_type, date_value = extract_date_from_query(last_message)
+    
+    # Get the range limits for predictions
+    min_date = predictions_df['ds'].min()
+    max_date = predictions_df['ds'].max()
     
     if date_type == "range":
         # Using Llama for generating prediction summaries as it has good comprehension
@@ -348,11 +353,38 @@ def prediction_agent(state: AgentState) -> Dict:
             return {"messages": messages + [{"role": "assistant", "content": response.content}]}
     
     elif date_type in ["specific", "relative"]:
-        # For specific or relative dates, find the closest match in our predictions
+        # For specific or relative dates, check if the date is beyond 90 days
         if date_value:
             try:
                 # Convert date_value to timestamp for comparison
                 target_date = pd.Timestamp(date_value)
+                
+                # Check if the target date is beyond our 90-day prediction window
+                if target_date > max_date:
+                    # Get the latest price from predictions_df (first row)
+                    latest_row = predictions_df.iloc[0]
+                    latest_date = latest_row['ds'].strftime('%Y-%m-%d')
+                    latest_prediction = float(latest_row['yhat'])
+                    
+                    # Get the furthest prediction (90th day)
+                    furthest_row = predictions_df.iloc[-1]
+                    furthest_date = furthest_row['ds'].strftime('%Y-%m-%d')
+                    furthest_prediction = float(furthest_row['yhat'])
+                    
+                    response = llama.invoke([
+                        HumanMessage(content=f"""
+                        The user asked for a prediction on {target_date.strftime('%Y-%m-%d')}, which is beyond our 90-day prediction window.
+                        
+                        Please explain that we can only provide predictions up to {max_date.strftime('%Y-%m-%d')}.
+                        
+                        Include the following information:
+                        - Latest available price: ₹{latest_prediction:.2f} on {latest_date}
+                        - Our furthest prediction: ₹{furthest_prediction:.2f} on {furthest_date}
+                        
+                        Make the response conversational and helpful, suggesting they ask about dates within our prediction window.
+                        """)
+                    ])
+                    return {"messages": messages + [{"role": "assistant", "content": response.content}]}
                 
                 # Create a new column with the difference between each date and the target date
                 predictions_df['date_diff'] = abs((predictions_df['ds'] - target_date).dt.total_seconds())
@@ -412,6 +444,56 @@ def prediction_agent(state: AgentState) -> Dict:
     
     return {"messages": messages + [{"role": "assistant", "content": response.content}]}
 
+
+def historical_price_agent(state: AgentState) -> Dict:
+    """
+    Handles queries about historical cardamom prices.
+    """
+    messages = state["messages"]
+    last_message = messages[-1]["content"]
+    
+    # Extract date information to focus the search
+    date_type, date_value = extract_date_from_query(last_message)
+    
+    # Formulate a search query based on the date information
+    if date_type == "none":
+        search_query = "historical cardamom prices trends data"
+    elif date_type == "range":
+        search_query = f"historical cardamom prices {last_message}"
+    else:
+        # For specific or relative dates
+        if date_value:
+            date_str = date_value.strftime('%B %Y')  # Format as "Month Year"
+            search_query = f"cardamom prices on {date_str} historical data"
+        else:
+            search_query = "historical cardamom prices trends data"
+    
+    # Use DDG search to get historical price information
+    search_results = ddg_search.invoke(search_query)
+    
+    # Process search results with Llama
+    response = llama.invoke([
+        HumanMessage(content=f"""
+        The user asked about historical cardamom prices: "{last_message}"
+        
+        Here are search results that might contain historical price information:
+        {search_results}
+        
+        Extract and summarize the most relevant historical cardamom price information.
+        Include:
+        1. Price ranges during the requested period if available
+        2. Historical trends and patterns
+        3. Factors that affected prices during that period
+        4. Any notable price fluctuations or stability
+        
+        Format this as a helpful historical market report. If you can't find specific 
+        historical data for the exact period requested, mention that and provide 
+        the closest available historical information.
+        """)
+    ])
+    
+    return {"messages": messages + [{"role": "assistant", "content": response.content}]}
+
 def info_agent(state: AgentState) -> Dict:
     """
     Handles queries about cardamom information.
@@ -439,6 +521,11 @@ def info_agent(state: AgentState) -> Dict:
     ])
     
     return {"messages": messages + [{"role": "assistant", "content": response.content}]}
+
+def general_agent(state: AgentState):
+    """
+    You are a cardamom expert and will ac
+    """
 
 def spiceboard_prices():
     """
@@ -623,6 +710,7 @@ def build_cardamom_agent_graph():
     workflow.add_node("prediction_agent", prediction_agent)
     workflow.add_node("info_agent", info_agent)
     workflow.add_node("price_fetch_agent", price_fetch_agent)
+    workflow.add_node("historical_price_agent", historical_price_agent)  # New node
     workflow.add_node("off_topic_agent", off_topic_agent)
     
     # Add conditional edges from router to appropriate agents
@@ -633,6 +721,7 @@ def build_cardamom_agent_graph():
             "prediction_agent": "prediction_agent",
             "info_agent": "info_agent",
             "price_fetch_agent": "price_fetch_agent",
+            "historical_price_agent": "historical_price_agent",  # New edge
             "off_topic_agent": "off_topic_agent"
         }
     )
@@ -641,6 +730,7 @@ def build_cardamom_agent_graph():
     workflow.add_edge("prediction_agent", END)
     workflow.add_edge("info_agent", END)
     workflow.add_edge("price_fetch_agent", END)
+    workflow.add_edge("historical_price_agent", END)  # New edge
     workflow.add_edge("off_topic_agent", END)
     
     # Set the entrypoint
@@ -651,21 +741,48 @@ def build_cardamom_agent_graph():
 # Create app instance
 cardamom_agent = build_cardamom_agent_graph()
 
-# Example of how to use the agent
-def run_cardamom_agent(query: str):
-    """Run the cardamom agent with a query."""
-    state = {"messages": [{"role": "human", "content": query}]}
+#run the cardamom agent
+def run_cardamom_agent(query: str, conversation_history: List[Dict] = None):
+    """Run the cardamom agent with a query and maintain conversation history."""
+    if conversation_history is None:
+        conversation_history = []
+    
+    # Add the new query to the history
+    conversation_history.append({"role": "human", "content": query})
+    
+    # Create state with full conversation history
+    state = {
+        "messages": [{"role": "human", "content": query}],
+        "conversation_history": conversation_history
+    }
+    
+    # Invoke agent
     result = cardamom_agent.invoke(state)
-    return result["messages"][-1]["content"]
+    
+    # Add the response to the conversation history
+    conversation_history.append({"role": "assistant", "content": result["messages"][-1]["content"]})
+    
+    # Return the response and updated history
+    return result["messages"][-1]["content"], conversation_history
 
-# Run locally testing 
 if __name__ == "__main__":
     # Example queries to test
     queries = [
-       "29/04/2025"  
+       "what will be the price of cardamom tomorrow " ,
     ]
     
     for query in queries:
         print(f"\nQuery: {query}")
         response = run_cardamom_agent(query)
-        print(f"Response: {response}")
+        
+        # Unpack response
+        response_text, message_history = response
+
+        # Prepare JSON structure
+        response_json = {
+            "response_text": response_text,
+            "messages": message_history
+        }
+
+        # Print nicely formatted JSON
+        print(json.dumps(response_json["response_text"], indent=4))
