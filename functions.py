@@ -4,7 +4,10 @@ import pandas as pd
 import pickle
 from typing import Tuple,Optional
 from langchain_core.messages import HumanMessage
+from langchain_community.tools.ddg_search import DuckDuckGoSearchRun
 
+# Initialize search tool
+ddg_search = DuckDuckGoSearchRun(description="Fetches the current and latest cardamom prices from the web",name="DuckDuckGo")
 
 
 # Date handling functions
