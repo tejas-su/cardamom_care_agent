@@ -29,7 +29,7 @@ class AgentState(Dict):
     next_agent: Optional[str] = None
     prediction_data: Optional[pd.DataFrame] = None
     search_results: Optional[str] = None
-    conversation_history: Optional[List[Dict]] = None  # Added for memory
+    conversation_history: Optional[List[Dict]] = None  # Saving messages in momory memory
 
 # Date handling functions
 def parse_relative_date(date_text: str) -> datetime:
@@ -242,22 +242,25 @@ def load_predictions():
 
 
 class routes(BaseModel):
-    agent : Literal['PREDICTION', 'INFO', 'PRICE_FETCH', 'HISTORICAL_PRICE', 'OFF_TOPIC'] = Field(...,description="""
+    agent : Literal['PREDICTION', 'INFO', 'PRICE_FETCH', 'HISTORICAL_PRICE', 'GREETING', 'CAPABILITY', 'OFF_TOPIC'] = Field(...,description="""
         - PREDICTION: If the query is about cardamom price predictions or forecasts
         - INFO: If the query is seeking information about cardamom (cultivation, diseases, etc.)
         - PRICE_FETCH: If the query is about current market prices of cardamom
         - HISTORICAL_PRICE: If the query is about past/historical cardamom prices
+        - GREETING: If the query is a greeting (hello, hi, etc.) or asks who the agent is
+        - CAPABILITY: If the query asks what the agent can do or how it can help
         - OFF_TOPIC: If the query is not related to cardamom""")
 
 # Agent Functions
+#router initial 
 def router(state: AgentState) -> Dict:
     """
-    Routes to the appropriate agent based on the query type.
+    Routes to the appropriate agent based on the query type using AI classification.
     """
     messages = state["messages"]
     last_message = messages[-1]["content"]
     
-    # Using LlamaScout for the router with updated classification
+    # Using LlamaScout for comprehensive routing
     llm_response = llamaScout.invoke([
         HumanMessage(content=f"""
         Analyze the following user query and determine which specialized agent should handle it:
@@ -265,6 +268,8 @@ def router(state: AgentState) -> Dict:
         Query: {last_message}
         
         Respond with exactly one of these options:
+        - GREETING: If the query is a greeting (hello, hi, etc.) or asks who the agent is
+        - CAPABILITY: If the query asks what the agent can do or how it can help
         - PREDICTION: If the query is about cardamom price predictions or forecasts
         - INFO: If the query is seeking information about cardamom (cultivation, diseases, etc.)
         - PRICE_FETCH: If the query is about current market prices of cardamom
@@ -278,6 +283,8 @@ def router(state: AgentState) -> Dict:
     agent_type = llm_response.content.strip()
     
     agent_mapping = {
+        "GREETING": "greeting_agent",
+        "CAPABILITY": "capability_agent",
         "PREDICTION": "prediction_agent",
         "INFO": "info_agent",
         "PRICE_FETCH": "price_fetch_agent",
@@ -701,6 +708,53 @@ def off_topic_agent(state: AgentState) -> Dict:
     
     return {"messages": messages + [{"role": "assistant", "content": polite_response}]}
 
+
+#Greeting s agent to greet the user or onboard
+def greeting_agent(state: AgentState) -> Dict:
+    """
+    Handles greetings and introduces itself as CardamomCare.
+    """
+    messages = state["messages"]
+    
+    introduction = """Hello! I'm CardamomCare, your cardamom industry assistant. I can help you with:
+
+1. Cardamom price predictions
+2. Current market prices
+3. Historical price trends
+4. Information about cardamom cultivation, diseases, and varieties
+
+How can I assist you with your cardamom-related questions today?"""
+    
+    return {"messages": messages + [{"role": "assistant", "content": introduction}]}
+
+
+#Gives the capability of the agent
+def capability_agent(state: AgentState) -> Dict:
+    """
+    Explains what CardamomCare can do.
+    """
+    messages = state["messages"]
+    
+    capabilities = """As CardamomCare, I'm specialized in all things cardamom and can help you with:
+
+1. **Price Predictions**: I can forecast cardamom prices for specific dates up to 90 days in the future using advanced modeling.
+
+2. **Current Market Prices**: I can provide you with the latest cardamom market prices from the Spice Board of India and other sources.
+
+3. **Historical Price Analysis**: I can show you historical price trends and patterns to help inform your decisions.
+
+4. **Cardamom Information**: I can provide details about:
+   - Different cardamom varieties
+   - Cultivation techniques
+   - Disease management
+   - Harvesting best practices
+   - Processing methods
+   - Market insights
+
+Whether you're a cardamom farmer, trader, or industry professional, I'm here to provide you with valuable information to support your cardamom-related activities. How can I assist you today?"""
+    
+    return {"messages": messages + [{"role": "assistant", "content": capabilities}]}
+
 # Build the graph
 def build_cardamom_agent_graph():
     workflow = StateGraph(AgentState)
@@ -710,7 +764,9 @@ def build_cardamom_agent_graph():
     workflow.add_node("prediction_agent", prediction_agent)
     workflow.add_node("info_agent", info_agent)
     workflow.add_node("price_fetch_agent", price_fetch_agent)
-    workflow.add_node("historical_price_agent", historical_price_agent)  # New node
+    workflow.add_node("historical_price_agent", historical_price_agent)
+    workflow.add_node("greeting_agent", greeting_agent)
+    workflow.add_node("capability_agent", capability_agent)  # New node
     workflow.add_node("off_topic_agent", off_topic_agent)
     
     # Add conditional edges from router to appropriate agents
@@ -718,10 +774,12 @@ def build_cardamom_agent_graph():
         "router",
         lambda x: x["next_agent"],
         {
-            "prediction_agent": "prediction_agent",
+            "prediction_agent": "prediction_agent", 
             "info_agent": "info_agent",
             "price_fetch_agent": "price_fetch_agent",
-            "historical_price_agent": "historical_price_agent",  # New edge
+            "historical_price_agent": "historical_price_agent",
+            "greeting_agent": "greeting_agent",
+            "capability_agent": "capability_agent",  
             "off_topic_agent": "off_topic_agent"
         }
     )
@@ -730,7 +788,9 @@ def build_cardamom_agent_graph():
     workflow.add_edge("prediction_agent", END)
     workflow.add_edge("info_agent", END)
     workflow.add_edge("price_fetch_agent", END)
-    workflow.add_edge("historical_price_agent", END)  # New edge
+    workflow.add_edge("historical_price_agent", END)
+    workflow.add_edge("greeting_agent", END)
+    workflow.add_edge("capability_agent", END)  
     workflow.add_edge("off_topic_agent", END)
     
     # Set the entrypoint
@@ -768,7 +828,7 @@ def run_cardamom_agent(query: str, conversation_history: List[Dict] = None):
 if __name__ == "__main__":
     # Example queries to test
     queries = [
-       "what will be the price of cardamom tomorrow " ,
+       "wat was the trend last week" ,
     ]
     
     for query in queries:
